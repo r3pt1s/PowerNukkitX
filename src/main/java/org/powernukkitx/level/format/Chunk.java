@@ -1,6 +1,7 @@
 package org.powernukkitx.level.format;
 
 import org.powernukkitx.Player;
+import org.powernukkitx.level.format.palette.BlockPalette;
 import org.powernukkitx.Server;
 import org.powernukkitx.block.Block;
 import org.powernukkitx.block.BlockAir;
@@ -26,7 +27,9 @@ import org.powernukkitx.level.structure.spawn.SpawnOverrideState;
 import org.powernukkitx.level.structure.spawn.StructureSpawnHandler;
 import org.powernukkitx.level.structure.spawn.StructureSpawnerData;
 import org.powernukkitx.level.structure.spawn.StructureSpawnerEntry;
+import org.powernukkitx.math.AxisAlignedBB;
 import org.powernukkitx.math.BlockVector3;
+import org.powernukkitx.math.NukkitMath;
 import org.powernukkitx.math.Vector3;
 import org.powernukkitx.nbt.tag.CompoundTag;
 import org.powernukkitx.registry.Registries;
@@ -35,17 +38,26 @@ import org.powernukkitx.scheduler.GenerationBlockUpdateQueue;
 import org.powernukkitx.scheduler.RandomBlockUpdateScheduler;
 import org.powernukkitx.utils.Utils;
 import org.powernukkitx.utils.collection.nb.Long2ObjectNonBlockingMap;
+import org.powernukkitx.network.process.cache.ClientBlobCacheManager;
 import com.google.common.base.Preconditions;
 
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufUtil;
+import io.netty.buffer.PooledByteBufAllocator;
 import org.jetbrains.annotations.ApiStatus;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.StampedLock;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
@@ -74,8 +86,42 @@ public class Chunk implements IChunk {
     protected final short[] renderHeightMap;
     protected final short[] rainHeightMap;
     protected final AtomicLong changes;
+    /**
+     * Set by every edit the network payload carries outside block data, cleared when a payload is
+     * built. Block edits are covered by per-section versions instead, see {@link NetworkPayload}.
+     */
+    private final AtomicBoolean networkPayloadStale = new AtomicBoolean(true);
+    private final AtomicReference<NetworkPayload> networkPayload = new AtomicReference<>();
+    private volatile boolean holdsNetworkPayloads;
+    private volatile long networkPayloadLastUse;
+    private static final AtomicLong NETWORK_PAYLOAD_BYTES = new AtomicLong();
+    private static volatile long networkPayloadBudget = Runtime.getRuntime().maxMemory() / 10;
+    private static final long NETWORK_PAYLOAD_IDLE_NANOS = TimeUnit.SECONDS.toNanos(60);
+    private final AtomicReferenceArray<SectionNetworkPayload> sectionNetworkPayloads;
+    /** Fits a section of up to 16 bits per block without regrowing the scratch buffer. */
+    private static final int SECTION_PAYLOAD_INITIAL_CAPACITY = 8192;
 
     protected final Long2ObjectNonBlockingMap<Entity> entities;
+    /**
+     * The same entities bucketed by 16-block Y section, so height-bounded queries do not have to
+     * walk the whole column. Fixed length - one bucket per section of this dimension - so the array
+     * itself is never reallocated, and buckets are created on first use because most chunks never
+     * hold an entity in most of their sections.
+     */
+    protected final AtomicReferenceArray<Long2ObjectNonBlockingMap<Entity>> entitySections;
+    /**
+     * Tallest entity currently indexed here. A query starts this far below its own range because
+     * entities are bucketed by their feet, so a tall entity standing lower still has to be visited.
+     * It only ever grows, which costs a few extra empty buckets but never misses an entity.
+     */
+    private volatile double maxIndexedEntityHeight;
+    private final Object maxIndexedEntityHeightLock = new Object();
+    /**
+     * How many entities are currently placed in {@link #entitySections}. If this ever drifts from
+     * {@link #entityCount} the index is incomplete, and queries fall back to the full entity map
+     * rather than returning a short answer.
+     */
+    protected final AtomicInteger indexedEntityCount = new AtomicInteger();
     /**
      * Live entity count. The non-blocking map computes size()/isEmpty() by summing a
      * striped counter, which is too slow for the per-chunk-per-tick emptiness checks
@@ -105,6 +151,7 @@ public class Chunk implements IChunk {
     private volatile boolean available;
     private volatile boolean discarded;
     private volatile boolean storageResolved = true;
+    private volatile boolean statesUpgraded;
     protected boolean isInitializing;
     protected List<CompoundTag> blockEntityNBT;
     protected List<CompoundTag> entityNBT;
@@ -136,6 +183,7 @@ public class Chunk implements IChunk {
         this.renderHeightMap = new short[256];
         this.rainHeightMap = ChunkRainHeightMap.create();
         this.entities = new Long2ObjectNonBlockingMap<>();
+        this.entitySections = newEntitySections(levelProvider);
         this.tiles = new Long2ObjectNonBlockingMap<>();
         this.tileList = new Long2ObjectNonBlockingMap<>();
         this.blockUpdateScheduler = new BlockUpdateScheduler(this, levelProvider.getCurrentTick());
@@ -152,6 +200,7 @@ public class Chunk implements IChunk {
         this.blockLock = new StampedLock();
         this.heightAndBiomeLock = new StampedLock();
         this.lightLock = new StampedLock();
+        this.sectionNetworkPayloads = new AtomicReferenceArray<>(this.sections.length);
     }
 
     private Chunk(
@@ -182,6 +231,7 @@ public class Chunk implements IChunk {
         this.renderHeightMap = new short[256];
         this.rainHeightMap = ChunkRainHeightMap.create();
         this.entities = new Long2ObjectNonBlockingMap<>();
+        this.entitySections = newEntitySections(levelProvider);
         this.tiles = new Long2ObjectNonBlockingMap<>();
         this.tileList = new Long2ObjectNonBlockingMap<>();
         this.blockUpdateScheduler = new BlockUpdateScheduler(this, levelProvider.getCurrentTick());
@@ -198,6 +248,7 @@ public class Chunk implements IChunk {
         this.blockLock = new StampedLock();
         this.heightAndBiomeLock = new StampedLock();
         this.lightLock = new StampedLock();
+        this.sectionNetworkPayloads = new AtomicReferenceArray<>(this.sections.length);
 
         new UnsafeChunk(this).recalculateRenderHeightMap();
     }
@@ -497,6 +548,7 @@ public class Chunk implements IChunk {
         try {
             int index = fY - getDimensionData().getMinSectionY();
             this.sections[index] = section;
+            dropSectionNetworkPayload(index);
 
             if (section != null) {
                 this.biomeSections[index] = section.biomes();
@@ -530,6 +582,30 @@ public class Chunk implements IChunk {
         } finally {
             heightAndBiomeLock.unlockRead(stamp);
         }
+    }
+
+    @Override
+    public boolean hasLegacyStates() {
+        if (this.statesUpgraded) {
+            return false;
+        }
+        long stamp = blockLock.readLock();
+        try {
+            for (ChunkSection section : this.sections) {
+                if (section != null && section.hasLegacyStates()) {
+                    return true;
+                }
+            }
+        } finally {
+            blockLock.unlockRead(stamp);
+        }
+        this.statesUpgraded = true;
+        return false;
+    }
+
+    @Override
+    public void markStatesUpgraded() {
+        this.statesUpgraded = true;
     }
 
     @Override
@@ -641,7 +717,7 @@ public class Chunk implements IChunk {
         long heightAndBiomeStamp = 0L;
 
         try {
-            setChanged();
+            setChangedForSave();
             ChunkSection section = getOrCreateSection(y >> 4);
             int localY = y & 0x0f;
             BlockState oldState = section.getBlockState(x, localY, z, layer);
@@ -691,7 +767,7 @@ public class Chunk implements IChunk {
         long heightAndBiomeStamp = 0L;
 
         try {
-            setChanged();
+            setChangedForSave();
             ChunkSection section = getOrCreateSection(y >> 4);
             int localY = y & 0x0f;
             BlockState oldState = section.getBlockState(x, localY, z, layer);
@@ -766,7 +842,7 @@ public class Chunk implements IChunk {
     public void setBlockSkyLight(int x, int y, int z, int level) {
         long stamp = lightLock.writeLock();
         try {
-            setChanged();
+            setChangedForSave();
             getOrCreateSection(y >> 4).setBlockSkyLight(x, y & 0x0f, z, (byte) level);
         } finally {
             lightLock.unlockWrite(stamp);
@@ -794,7 +870,7 @@ public class Chunk implements IChunk {
     public void setBlockLight(int x, int y, int z, int level) {
         long stamp = lightLock.writeLock();
         try {
-            setChanged();
+            setChangedForSave();
             getOrCreateSection(y >> 4).setBlockLight(x, y & 0x0f, z, (byte) level);
         } finally {
             lightLock.unlockWrite(stamp);
@@ -893,11 +969,27 @@ public class Chunk implements IChunk {
     @Override
     public void populateSkyLight() {
         batchProcess(unsafe -> {
+            final int maxHeight = getDimensionData().getMaxHeight();
+            final int minHeight = getDimensionData().getMinHeight();
+
+            // Fast path for a chunk with nothing in it, which is every chunk of a void or empty
+            // world. Sky light is a uniform 15 there, so the whole nibble array can be filled in one
+            // Arrays.fill per section instead of 16x16x(height) individual nibble writes - each of
+            // which otherwise goes through the freezable-array read/modify/write and reheats it.
+            if (isEmptyExceptAir(unsafe)) {
+                int minSectionY = getDimensionData().getMinSectionY();
+                for (int i = 0; i < getDimensionData().getChunkSectionCount(); i++) {
+                    ChunkSection section = unsafe.getOrCreateSection(minSectionY + i);
+                    if (section != null) section.skyLights().fill((byte) 15);
+                }
+                return;
+            }
+
             // basic light calculation; properties are read from the shared precomputed table (no per-cell Block alloc)
             for (int z = 0; z < 16; ++z) {
                 for (int x = 0; x < 16; ++x) { // iterating over all columns in chunk
                     int level = 15;
-                    for (int y = getDimensionData().getMaxHeight(); y >= getDimensionData().getMinHeight(); y--) {
+                    for (int y = maxHeight; y >= minHeight; y--) {
                         BlockState state = unsafe.getBlockState(x, y, z);
                         int packed = BlockLightProperties.packed(state);
                         if (!BlockLightProperties.isTransparent(packed)) {
@@ -913,6 +1005,20 @@ public class Chunk implements IChunk {
                 }
             }
         });
+    }
+
+    /**
+     * Whether every section of this chunk holds nothing but air on both layers, so sky light does
+     * not need to be traced column by column.
+     */
+    private static boolean isEmptyExceptAir(UnsafeChunk unsafe) {
+        for (ChunkSection section : unsafe.getSections()) {
+            if (section == null) continue;
+            for (BlockPalette layer : section.blockLayer()) {
+                if (!layer.isEmpty()) return false;
+            }
+        }
+        return true;
     }
 
     public void batchProcess(Consumer<UnsafeChunk> unsafeChunkConsumer) {
@@ -999,8 +1105,9 @@ public class Chunk implements IChunk {
         if (this.entities.put(entity.runtimeId(), entity) == null) {
             this.entityCount.incrementAndGet();
         }
+        reindexEntitySection(entity);
         if (!(entity instanceof Player) && this.isInit) {
-            this.setChanged();
+            this.setChangedForSave();
         }
     }
 
@@ -1011,10 +1118,142 @@ public class Chunk implements IChunk {
             synchronized (this.entities) {
                 if (this.entities.remove(entity.runtimeId()) != null) {
                     this.entityCount.decrementAndGet();
+                    unindexEntitySection(entity);
                 }
                 if (!(entity instanceof Player) && this.isInit) {
-                    this.setChanged();
+                    this.setChangedForSave();
                 }
+            }
+        }
+    }
+
+    private static AtomicReferenceArray<Long2ObjectNonBlockingMap<Entity>> newEntitySections(LevelProvider levelProvider) {
+        return new AtomicReferenceArray<>(levelProvider.getDimensionData().getChunkSectionCount());
+    }
+
+    private Long2ObjectNonBlockingMap<Entity> entitySection(int section) {
+        Long2ObjectNonBlockingMap<Entity> bucket = this.entitySections.get(section);
+        if (bucket != null) return bucket;
+        Long2ObjectNonBlockingMap<Entity> created = new Long2ObjectNonBlockingMap<>();
+        return this.entitySections.compareAndSet(section, null, created) ? created : this.entitySections.get(section);
+    }
+
+    /**
+     * Index of the 16-block tall section holding {@code worldY}, clamped to this chunk's range.
+     */
+    private int sectionIndexOf(double worldY) {
+        int section = (NukkitMath.floorDouble(worldY) >> 4) - getDimensionData().getMinSectionY();
+        if (section < 0) return 0;
+        int last = this.entitySections.length() - 1;
+        return section > last ? last : section;
+    }
+
+    private void indexEntitySection(Entity entity, int section) {
+        if (entitySection(section).put(entity.getId(), entity) == null) {
+            this.indexedEntityCount.incrementAndGet();
+        }
+        trackEntityHeight(entity);
+        entity.chunkSectionIndex = section;
+    }
+
+    private boolean removeFromEntitySection(int section, Entity entity) {
+        Long2ObjectNonBlockingMap<Entity> bucket = this.entitySections.get(section);
+        return bucket != null && bucket.remove(entity.getId()) != null;
+    }
+
+    private void unindexEntitySection(Entity entity) {
+        int previous = entity.chunkSectionIndex;
+        if (previous >= 0 && previous < this.entitySections.length()
+                && removeFromEntitySection(previous, entity)) {
+            this.indexedEntityCount.decrementAndGet();
+        }
+        entity.chunkSectionIndex = -1;
+    }
+
+    /**
+     * Places an entity in its bucket unconditionally, dropping any bucket of this chunk it was
+     * previously in. Used when an entity joins this chunk: it may already carry the section index
+     * it held in a different chunk, so {@link #updateEntitySection} - which short-circuits when the
+     * index already matches - would leave it unindexed here.
+     */
+    private void reindexEntitySection(Entity entity) {
+        int section = sectionIndexOf(entity.y);
+        int previous = entity.chunkSectionIndex;
+        if (previous >= 0 && previous < this.entitySections.length() && previous != section
+                && removeFromEntitySection(previous, entity)) {
+            this.indexedEntityCount.decrementAndGet();
+        }
+        indexEntitySection(entity, section);
+    }
+
+    /**
+     * Grows {@link #maxIndexedEntityHeight} to cover how far this entity reaches above its feet.
+     * Has to read the live bounding box rather than {@code getHeight()}: scale multiplies the box,
+     * so a scaled-up mob reaches well past its default height.
+     */
+    private void trackEntityHeight(Entity entity) {
+        AxisAlignedBB bb = entity.boundingBox;
+        if (bb == null) return;
+        double reach = bb.getMaxY() - entity.y;
+        if (reach > this.maxIndexedEntityHeight) {
+            // Two threads can get here at once, and a plain write could drop the larger value
+            synchronized (this.maxIndexedEntityHeightLock) {
+                if (reach > this.maxIndexedEntityHeight) {
+                    this.maxIndexedEntityHeight = reach;
+                }
+            }
+        }
+    }
+
+    /**
+     * Re-buckets an entity whose Y has moved it into another section. Called from the same place
+     * that re-buckets an entity between chunks, so the two indexes stay in step. Also called when
+     * the entity's box changes size, which is why the height is tracked before the early return.
+     */
+    public void updateEntitySection(Entity entity) {
+        int section = sectionIndexOf(entity.y);
+        int previous = entity.chunkSectionIndex;
+        if (section == previous) {
+            trackEntityHeight(entity);
+            return;
+        }
+        if (previous >= 0 && previous < this.entitySections.length()
+                && removeFromEntitySection(previous, entity)) {
+            this.indexedEntityCount.decrementAndGet();
+        }
+        indexEntitySection(entity, section);
+    }
+
+    /**
+     * Visits the entities whose section overlaps the given world Y range, plus the buckets below it
+     * that a tall entity could reach into.
+     * <p>
+     * The flat {@link #getEntities()} map stays authoritative; this is an accelerator for queries
+     * that only care about a few blocks of height, which would otherwise walk every entity in a
+     * 16 x 16 x 384 column. Near an item pile or a mob farm that is the difference between visiting
+     * every entity in the chunk and visiting one section's worth.
+     */
+    public void forEachEntityInYRange(double minY, double maxY, Consumer<Entity> action) {
+        if (this.indexedEntityCount.get() != this.entityCount.get()) {
+            // The index is not accounting for every entity, so trust the authoritative map. This
+            // degrades to the old full-column scan instead of silently missing an entity.
+            for (Entity entity : this.entities.values()) {
+                action.accept(entity);
+            }
+            return;
+        }
+        int from = sectionIndexOf(minY - this.maxIndexedEntityHeight);
+        int to = sectionIndexOf(maxY);
+        for (int i = from; i <= to; i++) {
+            Long2ObjectNonBlockingMap<Entity> section = this.entitySections.get(i);
+            if (section == null) continue;
+            // An empty section still hands out a values() view plus a snapshot iterator, and that
+            // iterator's constructor walks the key table looking for a first entry it will never
+            // find. Most sections a collision query touches are empty, so the size check pays for
+            // itself many times over.
+            if (section.isEmpty()) continue;
+            for (Entity entity : section.values()) {
+                action.accept(entity);
             }
         }
     }
@@ -1390,6 +1629,7 @@ public class Chunk implements IChunk {
             this.available = false;
             this.discarded = true;
         }
+        releaseNetworkPayloads();
 
         for (Entity entity : new ArrayList<>(this.getEntities().values())) {
             if (entity instanceof Player) {
@@ -1503,7 +1743,7 @@ public class Chunk implements IChunk {
     public void setAabbVolumes(AabbVolumes aabbVolumes) {
         this.aabbVolumes = Preconditions.checkNotNull(aabbVolumes);
         if (this.isInit) {
-            this.setChanged();
+            this.setChangedForSave();
         }
     }
 
@@ -1522,7 +1762,263 @@ public class Chunk implements IChunk {
     @Override
     public void setChanged() {
         this.changes.incrementAndGet();
+        markNetworkPayloadStale();
     }
+
+    /**
+     * Marks the chunk for saving without touching the cached network payload, for edits the
+     * payload either does not carry (light, entities) or validates on its own (blocks, through
+     * {@link ChunkSection#blockChanges()}).
+     */
+    private void setChangedForSave() {
+        this.changes.incrementAndGet();
+    }
+
+    /**
+     * Must be called after the edit has landed. The release store pairs with the acquiring
+     * {@code getAndSet} in {@link #beginNetworkPayload()}, so an edit made without the chunk lock
+     * is either visible to the serializer or leaves the payload stale.
+     */
+    void markNetworkPayloadStale() {
+        this.networkPayloadStale.setRelease(true);
+    }
+
+    /**
+     * Serialized network bytes of one section, as written by {@link ChunkSection#writeToBuf}.
+     * Valid while {@link #section()} is still installed and its {@link ChunkSection#blockChanges()}
+     * still equals {@link #version()}.
+     */
+    @ApiStatus.Internal
+    public static final class SectionNetworkPayload {
+        private final ChunkSection section;
+        private final long version;
+        private final byte[] data;
+        private volatile ClientBlobCacheManager.Blob blob;
+
+        private SectionNetworkPayload(ChunkSection section, long version, byte[] data) {
+            this.section = section;
+            this.version = version;
+            this.data = data;
+        }
+
+        public ChunkSection section() {
+            return section;
+        }
+
+        public long version() {
+            return version;
+        }
+
+        /**
+         * @return the serialized section, which callers must not modify
+         */
+        public byte[] data() {
+            return data;
+        }
+
+        /**
+         * @return the client cache blob of {@link #data()}, hashed on first use.
+         */
+        public ClientBlobCacheManager.Blob blob() {
+            ClientBlobCacheManager.Blob result = this.blob;
+            if (result == null) {
+                result = ClientBlobCacheManager.rememberBlob(this.data);
+                this.blob = result;
+            }
+            return result;
+        }
+
+        boolean isValidFor(@Nullable ChunkSection installed) {
+            return installed == this.section && installed.blockChanges().get() == this.version;
+        }
+    }
+
+    /**
+     * Serialized bytes of a section of this chunk, reused until a block in it changes or the section
+     * is replaced. Safe to call from any thread, with or without the chunk lock: a copy taken while
+     * the section is being edited is never returned again, because the edit advances
+     * {@link ChunkSection#blockChanges()} past the version read here.
+     *
+     * @param section a section currently installed in this chunk
+     */
+    @ApiStatus.Internal
+    public @NotNull SectionNetworkPayload getSectionNetworkPayload(@NotNull ChunkSection section) {
+        final int index = section.y() - getDimensionData().getMinSectionY();
+        final long version = section.blockChanges().get();
+        final SectionNetworkPayload cached = this.sectionNetworkPayloads.get(index);
+        if (cached != null && cached.section == section && cached.version == version) {
+            this.networkPayloadLastUse = System.nanoTime();
+            return cached;
+        }
+        final ByteBuf buffer = PooledByteBufAllocator.DEFAULT.heapBuffer(SECTION_PAYLOAD_INITIAL_CAPACITY);
+        final SectionNetworkPayload created;
+        try {
+            section.writeToBuf(buffer);
+            created = new SectionNetworkPayload(section, version, ByteBufUtil.getBytes(buffer));
+        } finally {
+            buffer.release();
+        }
+        if (reserveNetworkPayloadBytes(created.data.length)) {
+            discardSectionNetworkPayload(this.sectionNetworkPayloads.getAndSet(index, created));
+            touchNetworkPayloads();
+        } else {
+            discardSectionNetworkPayload(this.sectionNetworkPayloads.getAndSet(index, null));
+        }
+        return created;
+    }
+
+    /**
+     * A serialized {@code LevelChunkPacket} payload, stored as its sections plus the bytes that
+     * follow them, so section bytes are shared with {@link #getSectionNetworkPayload} rather than
+     * held twice.
+     *
+     * @param sections      one entry per section slot, {@code null} where the slot was empty
+     * @param subChunkCount number of sub-chunks the payload writes, absent ones included
+     * @param tail          biomes, border blocks and block entity NBT, which must not be modified
+     */
+    @ApiStatus.Internal
+    public record NetworkPayload(SectionNetworkPayload[] sections, int subChunkCount, byte[] tail) {
+    }
+
+    /**
+     * @return the cached network payload if it still matches this chunk's content, otherwise
+     * {@code null}. Safe to call from any thread.
+     */
+    @ApiStatus.Internal
+    public @Nullable NetworkPayload getNetworkPayload() {
+        if (this.networkPayloadStale.get()) {
+            return null;
+        }
+        final NetworkPayload payload = this.networkPayload.get();
+        if (payload == null) {
+            return null;
+        }
+        final SectionNetworkPayload[] cachedSections = payload.sections();
+        for (int i = 0; i < cachedSections.length; i++) {
+            final SectionNetworkPayload cached = cachedSections[i];
+            final ChunkSection installed = this.sections[i];
+            if (cached == null ? installed != null : !cached.isValidFor(installed)) {
+                return null;
+            }
+        }
+        this.networkPayloadLastUse = System.nanoTime();
+        return payload;
+    }
+
+    /**
+     * Starts serializing a new network payload. Must be called inside {@link #batchProcess} before
+     * any content is read, followed by {@link #setNetworkPayload} in the same batch, so that
+     * payloads are stored in the order they were built.
+     */
+    @ApiStatus.Internal
+    public void beginNetworkPayload() {
+        discardNetworkPayload(this.networkPayload.getAndSet(null));
+        this.networkPayloadStale.getAndSet(false);
+    }
+
+    /**
+     * Caches the payload started by {@link #beginNetworkPayload()}. An edit made in between leaves
+     * it stale, so it is never returned.
+     */
+    @ApiStatus.Internal
+    public void setNetworkPayload(@NotNull NetworkPayload payload) {
+        final SectionNetworkPayload[] payloadSections = payload.sections();
+        for (int i = 0; i < payloadSections.length; i++) {
+            if (payloadSections[i] != null && this.sectionNetworkPayloads.get(i) != payloadSections[i]) {
+                return;
+            }
+        }
+        if (!reserveNetworkPayloadBytes(payload.tail().length)) {
+            return;
+        }
+        discardNetworkPayload(this.networkPayload.getAndSet(payload));
+        touchNetworkPayloads();
+    }
+
+    /**
+     * Drops this chunk's cached network payloads if none has been used for a minute. Called
+     * periodically from {@link org.powernukkitx.level.Level#doLevelGarbageCollection(boolean)}.
+     *
+     * @param now the current {@link System#nanoTime()}
+     */
+    @ApiStatus.Internal
+    public void expireNetworkPayloads(long now) {
+        if (this.holdsNetworkPayloads && now - this.networkPayloadLastUse >= NETWORK_PAYLOAD_IDLE_NANOS) {
+            releaseNetworkPayloads();
+        }
+    }
+
+    /**
+     * Drops every cached network payload of this chunk and returns its bytes to the shared budget.
+     * Safe to call from any thread.
+     */
+    @ApiStatus.Internal
+    public void releaseNetworkPayloads() {
+        this.holdsNetworkPayloads = false;
+        discardNetworkPayload(this.networkPayload.getAndSet(null));
+        for (int i = 0; i < this.sectionNetworkPayloads.length(); i++) {
+            final SectionNetworkPayload old = this.sectionNetworkPayloads.getAndSet(i, null);
+            if (old != null) {
+                releaseNetworkPayloadBytes(old.data.length);
+            }
+        }
+    }
+
+    /**
+     * @return bytes currently held by cached network payloads across all chunks, bounded by
+     * {@code chunk-settings.payloadCacheMemoryMb} and 10% of the maximum heap
+     */
+    @ApiStatus.Internal
+    public static long getCachedNetworkPayloadBytes() {
+        return NETWORK_PAYLOAD_BYTES.get();
+    }
+
+    void dropSectionNetworkPayload(int index) {
+        discardSectionNetworkPayload(this.sectionNetworkPayloads.getAndSet(index, null));
+    }
+
+    private void touchNetworkPayloads() {
+        this.networkPayloadLastUse = System.nanoTime();
+        this.holdsNetworkPayloads = true;
+    }
+
+    private void discardSectionNetworkPayload(@Nullable SectionNetworkPayload old) {
+        if (old != null) {
+            releaseNetworkPayloadBytes(old.data.length);
+            discardNetworkPayload(this.networkPayload.getAndSet(null));
+        }
+    }
+
+    private static void discardNetworkPayload(@Nullable NetworkPayload old) {
+        if (old != null) {
+            releaseNetworkPayloadBytes(old.tail().length);
+        }
+    }
+
+    private static boolean reserveNetworkPayloadBytes(long bytes) {
+        if (NETWORK_PAYLOAD_BYTES.addAndGet(bytes) <= networkPayloadBudget) {
+            return true;
+        }
+        releaseNetworkPayloadBytes(bytes);
+        return false;
+    }
+
+    private static void releaseNetworkPayloadBytes(long bytes) {
+        NETWORK_PAYLOAD_BYTES.addAndGet(-bytes);
+    }
+
+    /**
+     * Sets the shared budget for cached network payloads from
+     * {@code chunk-settings.payloadCacheMemoryMb}, capped at 10% of the maximum heap. Until this is
+     * called the budget is 10% of the maximum heap.
+     *
+     * @param megabytes the configured budget; {@code 0} or less disables caching
+     */
+    @ApiStatus.Internal
+    public static void setNetworkPayloadBudgetMb(int megabytes) {
+        networkPayloadBudget = Math.min(Runtime.getRuntime().maxMemory() / 10, Math.max(0, megabytes) * 1024L * 1024L);
+    }
+
 
     @Override
     public void setChanged(boolean changed) {
@@ -1647,12 +2143,14 @@ public class Chunk implements IChunk {
         int index = (localX << 4) | localZ;
         if (isBorderBlock(newState)) {
             this.borderBlockMap[index] = true;
+            markNetworkPayloadStale();
             return;
         }
 
         if (!isBorderBlock(oldState)) return;
 
         this.borderBlockMap[index] = hasBorderBlockInColumnInternal(localX, localZ);
+        markNetworkPayloadStale();
     }
 
     private boolean hasBorderBlockInColumnInternal(int localX, int localZ) {

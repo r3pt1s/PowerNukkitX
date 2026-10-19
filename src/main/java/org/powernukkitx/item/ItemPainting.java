@@ -4,6 +4,7 @@ import org.powernukkitx.Player;
 import org.powernukkitx.block.Block;
 import org.powernukkitx.entity.Entity;
 import org.powernukkitx.entity.item.EntityPainting;
+import org.powernukkitx.item.definition.ItemDefinition;
 import org.powernukkitx.level.Level;
 import org.powernukkitx.level.format.IChunk;
 import org.powernukkitx.level.vibration.VibrationEvent;
@@ -14,6 +15,8 @@ import org.powernukkitx.nbt.tag.CompoundTag;
 import org.powernukkitx.nbt.tag.FloatTag;
 import org.powernukkitx.nbt.tag.ListTag;
 
+import static org.powernukkitx.block.property.CommonBlockProperties.DIRECTION;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
@@ -22,7 +25,10 @@ import java.util.concurrent.ThreadLocalRandom;
  * @author MagicDroidX (Nukkit Project)
  */
 public class ItemPainting extends Item {
-    private static final int[] DIRECTION = {2, 3, 4, 5};
+    public static final ItemDefinition DEFINITION = Item.DEFAULT_DEFINITION.toBuilder()
+            .canBeActivated(true)
+            .build();
+
     private static final int[] RIGHT = {4, 5, 3, 2};
     private static final double OFFSET = 0.53125;
 
@@ -35,12 +41,7 @@ public class ItemPainting extends Item {
     }
 
     public ItemPainting(Integer meta, int count) {
-        super(PAINTING, 0, count, "Painting");
-    }
-
-    @Override
-    public boolean canBeActivated() {
-        return true;
+        super(PAINTING, 0, count, "Painting", DEFINITION);
     }
 
     @Override
@@ -63,7 +64,7 @@ public class ItemPainting extends Item {
         }
         if (validMotives.isEmpty()) return false;
 
-        int direction = DIRECTION[face.getIndex() - 2];
+        int direction = face.getHorizontalIndex();
         EntityPainting.Motive motive = validMotives.get(ThreadLocalRandom.current().nextInt(validMotives.size()));
 
         Vector3 position = new Vector3(target.x + 0.5, target.y + 0.5, target.z + 0.5);
@@ -91,6 +92,7 @@ public class ItemPainting extends Item {
 
         CompoundTag nbt = new CompoundTag()
                 .putByte("Direction", direction)
+                .putByte("Dir", (2 - direction) & 3)
                 .putString("Motif", motive.title)
                 .putList("Pos", new ListTag<FloatTag>()
                         .add(new FloatTag((float) position.x))
@@ -101,7 +103,7 @@ public class ItemPainting extends Item {
                         .add(new FloatTag(0))
                         .add(new FloatTag(0)))
                 .putList("Rotation", new ListTag<FloatTag>()
-                        .add(new FloatTag(direction * 90))
+                        .add(new FloatTag(((2 - direction) & 3) * 90f))
                         .add(new FloatTag(0)));
 
         EntityPainting entity = (EntityPainting) Entity.createEntity(Entity.PAINTING, chunk, nbt);

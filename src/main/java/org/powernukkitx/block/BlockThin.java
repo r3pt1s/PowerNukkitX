@@ -1,5 +1,7 @@
 package org.powernukkitx.block;
 
+import org.powernukkitx.block.definition.BlockDefinition;
+
 import org.powernukkitx.Player;
 import org.powernukkitx.item.Item;
 import org.powernukkitx.level.Level;
@@ -19,15 +21,17 @@ import static org.powernukkitx.math.VectorMath.calculateFace;
  * @apiNote Implements BlockConnectable only in PowerNukkit
  */
 
-public abstract class BlockThin extends BlockTransparent implements BlockConnectable {
+public abstract class BlockThin extends BlockTransparent implements BlockConnectable, StateDeriving {
+    public static final BlockDefinition DEFINITION = TRANSPARENT.toBuilder()
+            .isSolid(false)
+            .build();
 
     public BlockThin(BlockState blockState) {
-        super(blockState);
+        super(blockState, DEFINITION);
     }
 
-    @Override
-    public boolean isSolid() {
-        return false;
+    public BlockThin(BlockState blockState, BlockDefinition definition) {
+        super(blockState, definition);
     }
 
     @Override
@@ -87,6 +91,7 @@ public abstract class BlockThin extends BlockTransparent implements BlockConnect
         };
     }
 
+    @Override
     public boolean autoConfigureState() {
         return HorizontalConnections.configure(this);
     }
